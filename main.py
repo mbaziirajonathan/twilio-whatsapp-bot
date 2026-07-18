@@ -1,74 +1,63 @@
-# main.py
-from fastapi import FastAPI, Response, Request, BackgroundTasks
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
-from twilio.rest import Client
-from ai_logic import get_client, generate_ai_response
-from database import get_session, save_session, log_activity
-import os, traceback, time
+from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
+import os
+
+from database import init_db, save_message, get_chat_history, clear_history
+from ai_logic import process_query
+
 load_dotenv()
 
-app = FastAPI(title="UCE Tutor WhatsApp API v1.0")
-client = get_client()
+app = FastAPI(title="NCDC UNEB Science Tutor Bot")
 
-ADMIN_NUMBER = "256751040731"
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
-TWILIO_FROM = 'whatsapp:+14155238886' # Sandbox number
-twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
+# Run once when Render starts
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    print("Database initialized")
 
-LAST_REQUEST = {}
-def is_rate_limited(phone: str, seconds=3):
-    now = time.time()
-    if phone in LAST_REQUEST and now - LAST_REQUEST[phone] < seconds: return True
-    LAST_REQUEST[phone] = now
-    return False
+@app.get("/")
+def home():
+    return {"status": "NCDC UNEB Science Tutor Bot is Live", "subjects": ["Physics", "Chemistry", "Biology"]}
 
-def parse_command(message: str):
-    msg_lower = message.lower()
-    subject, class_level = "Biology", "S4"
-    if "physics" in msg_lower: subject = "Physics"
-    elif "chemistry" in msg_lower: subject = "Chemistry"
-    for i in ["S1","S2","S3","S4"]:
-        if i.lower() in msg_lower: class_level = i; break
-    return subject, class_level, message
+@app.post("/webhook")
+async def whatsapp_webhook(request: Request):
+    """Twilio sends POST here"""
+    form = await request.form()
+    user_msg = form.get("Body", "").strip()
+    phone = form.get("From", "")
 
-@app.post("/webhook", response_class=PlainTextResponse)
-async def twilio_webhook(request: Request, background_tasks: BackgroundTasks):
+    print(f"Message from {phone}: {user_msg}")
+
+    # Handle reset command
+    if user_msg.lower() in ["reset", "clear", "new chat"]:
+        clear_history(phone)
+        resp = MessagingResponse()
+        resp.message("History cleared. Let's start fresh! Ask me any S1-S6 Physics, Chemistry, or Biology question.")
+        return Response(content=str(resp), media_type="application/xml")
+
+    # 1. Get chat history from DB for context
+    history = get_chat_history(phone, limit=6) # last 3 Q&A
+
+    # 2. Get AI response with NCDC/UNEB prompt
     try:
-        form = await request.form()
-        from_number = form.get("From", "").replace("whatsapp:", "").replace("+", "")
-        message = form.get("Body", "").strip()
-        if not from_number or not message: return "Send a message to start"
-
-        if is_rate_limited(from_number): return "⚡ Please wait 3 seconds"
-
-        subject, class_level, clean_message = parse_command(message)
-        background_tasks.add_task(process_message, from_number, clean_message, subject, class_level)
-        return "🤖 UCE Tutor is typing..." # Instant reply to avoid Twilio timeout
-
+        ai_reply = process_query(user_msg, history)
     except Exception as e:
-        print(f"[WEBHOOK CRASH] {traceback.format_exc()}")
-        return "System error. Admin notified."
+        print("AI ERROR:", e)
+        ai_reply = "Sorry, I had a problem thinking. Please try again."
 
-def process_message(from_number, message, subject, class_level):
-    try:
-        chat_history, activities_log = get_session(from_number, subject, class_level)
-        history_text = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history[-6:]])
-        full_prompt = f"History:\n{history_text}\n\nNew Question: {message}"
+    # 3. Save to DB
+    save_message(phone, "user", user_msg)
+    save_message(phone, "assistant", ai_reply)
 
-        ai_reply = generate_ai_response(client, full_prompt, subject, class_level) # Anti-hallucination here
+    # 4. Reply back to Twilio
+    resp = MessagingResponse()
+    resp.message(ai_reply)
 
-        chat_history.extend([{"role": "user", "content": message}, {"role": "assistant", "content": ai_reply}])
-        save_session(from_number, subject, class_level, chat_history, activities_log)
-        log_activity(from_number, subject, class_level, f"WhatsApp: {message}")
+    return Response(content=str(resp), media_type="application/xml")
 
-        # SEND BACK TO WHATSAPP
-        if twilio_client:
-            twilio_client.messages.create(from_=TWILIO_FROM, body=ai_reply, to=f'whatsapp:+{from_number}')
-        print(f"[SENT TO {from_number}]: {ai_reply[:50]}...")
-
-    except Exception as e:
-        print(f"[PROCESS CRASH] {traceback.format_exc()}")
-        if twilio_client:
-            twilio_client.messages.create(from_=TWILIO_FROM, body="Sorry, system error. Try again.", to=f'whatsapp:+{from_number}')
+@app.get("/webhook")
+def verify_webhook():
+    """For Render health check"""
+    return {"status": "webhook is running"}
